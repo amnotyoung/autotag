@@ -1,0 +1,1045 @@
+# ==============================================
+# KOICA TAG v3.0 - Agent 1 질문 생성 강화
+# ==============================================
+# 
+# 🔧 v3.0 핵심 개선:
+# 1. Agent 1 프롬프트에서 템플릿 제거
+# 2. "질문 생성 → 답변" 2단계 구조
+# 3. Few-shot 예시 강조
+# 4. 플레이스홀더 검증 강화
+# ==============================================
+
+import torch
+import gc
+import time
+from collections import defaultdict
+from typing import List, Dict, Tuple, Optional
+import re
+
+assert torch.cuda.is_available(), "❌ GPU 런타임이 아닙니다!"
+print(f"✅ GPU: {torch.cuda.get_device_name(0)}")
+print(f"✅ VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f}GB")
+
+!pip install -q pdfplumber gradio sentence-transformers huggingface-hub
+!pip install -q llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121
+!pip install -q pandas numpy
+
+print("\n✅ 패키지 설치 완료!\n")
+
+from huggingface_hub import hf_hub_download
+from llama_cpp import Llama
+from sentence_transformers import SentenceTransformer
+import gradio as gr
+import pdfplumber
+import numpy as np
+import pandas as pd
+
+print("📥 Llama 3.1 8B 다운로드 중...")
+
+model_path = hf_hub_download(
+    repo_id="QuantFactory/Meta-Llama-3.1-8B-Instruct-GGUF",
+    filename="Meta-Llama-3.1-8B-Instruct.Q6_K.gguf",
+    local_dir="./models"
+)
+
+print("🔄 LLM 초기화 중...")
+llm = Llama(
+    model_path=model_path,
+    n_ctx=16384,
+    n_gpu_layers=-1,
+    n_batch=512,
+    n_threads=4,
+    use_mlock=True,
+    verbose=False
+)
+print("✅ LLM 준비 완료!\n")
+
+print("🔄 한국어 임베딩 모델 로딩...")
+try:
+    embedder = SentenceTransformer('jhgan/ko-sroberta-multitask', device='cuda')
+    print("✅ 한국어 임베딩 준비 완료!\n")
+except:
+    embedder = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2', device='cuda')
+    print("✅ 다국어 임베딩 준비 완료!\n")
+
+if 'demo' in dir():
+    try:
+        demo.close()
+        del demo
+        gc.collect()
+    except:
+        pass
+
+timing_stats = defaultdict(list)
+
+def track_time(func):
+    def wrapper(*args, **kwargs):
+        start = time.time()
+        result = func(*args, **kwargs)
+        elapsed = time.time() - start
+        timing_stats[func.__name__].append(elapsed)
+        print(f"  ⏱️ {func.__name__}: {elapsed:.2f}초")
+        return result
+    return wrapper
+
+# ==============================================
+# RAG 함수들 (v2.9와 동일)
+# ==============================================
+
+def chunk_text(text: str, chunk_size: int = 2000, overlap: int = 400) -> List[Dict]:
+    chunks = []
+    start = 0
+    chunk_id = 0
+    
+    page_markers = [m.start() for m in re.finditer(r'(페이지\s*\d+|Page\s*\d+|\f)', text)]
+    
+    while start < len(text):
+        end = min(start + chunk_size, len(text))
+        chunk_text = text[start:end]
+        
+        estimated_page = 1
+        for marker_pos in page_markers:
+            if marker_pos <= start:
+                estimated_page += 1
+        
+        if not page_markers:
+            estimated_page = (start // 2000) + 1
+        
+        chunks.append({
+            "id": chunk_id,
+            "text": chunk_text,
+            "start": start,
+            "end": end,
+            "page": estimated_page
+        })
+        
+        chunk_id += 1
+        start = end - overlap
+        if end >= len(text):
+            break
+    
+    return chunks
+
+
+def create_vector_db(chunks: List[Dict], batch_size: int = 32) -> Dict:
+    texts = [chunk["text"] for chunk in chunks]
+    print(f"  💾 {len(chunks)}개 청크 벡터화 중...")
+    
+    all_embeddings = []
+    
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i+batch_size]
+        batch_emb = embedder.encode(
+            batch, 
+            show_progress_bar=False,
+            device='cuda',
+            batch_size=batch_size
+        )
+        all_embeddings.append(batch_emb)
+        
+        if i % 128 == 0 and i > 0:
+            torch.cuda.empty_cache()
+    
+    embeddings = np.vstack(all_embeddings) if len(all_embeddings) > 1 else all_embeddings[0]
+    
+    return {"chunks": chunks, "embeddings": embeddings}
+
+
+def _format_chunks(
+    vector_db: Dict, 
+    similarities: np.ndarray, 
+    indices: np.ndarray, 
+    fallback: bool = False
+) -> Tuple[str, List[int]]:
+    relevant_chunks = []
+    page_numbers = []
+    
+    for i in indices:
+        chunk = vector_db['chunks'][i]
+        similarity = similarities[i]
+        page_numbers.append(chunk['page'])
+        
+        if similarity > 0.6:
+            context_len = 1500
+            marker = "🟢"
+        elif similarity > 0.4:
+            context_len = 1200
+            marker = "🟡"
+        else:
+            context_len = 900
+            marker = "🟠" if not fallback else "⚠️"
+        
+        relevant_chunks.append(
+            f"{marker} [p.{chunk['page']} | 관련도: {similarity:.1%}]\n{chunk['text'][:context_len]}"
+        )
+    
+    if fallback:
+        header = "⚠️ 직접 매칭 없음 (유사 항목)\n\n"
+    else:
+        header = ""
+    
+    context = header + "\n\n" + "="*50 + "\n\n".join(relevant_chunks)
+    pages_found = sorted(set(page_numbers))
+    
+    return context, pages_found
+
+
+def search_relevant_chunks(
+    query: str, 
+    vector_db: Dict, 
+    top_k: int = 10,
+    min_similarity: float = 0.2
+) -> Tuple[str, List[int]]:
+    query_embedding = embedder.encode([query], device='cuda')
+    similarities = np.dot(vector_db["embeddings"], query_embedding.T).flatten()
+    
+    valid_indices = np.where(similarities >= min_similarity)[0]
+    
+    if len(valid_indices) == 0:
+        top_indices = np.argsort(similarities)[-min(5, len(similarities)):][::-1]
+        return _format_chunks(vector_db, similarities, top_indices, fallback=True)
+    
+    top_k_valid = min(top_k, len(valid_indices))
+    top_indices = valid_indices[np.argsort(similarities[valid_indices])[-top_k_valid:][::-1]]
+    
+    return _format_chunks(vector_db, similarities, top_indices)
+
+
+def detect_and_remove_repetition(text: str, min_repeat: int = 3) -> str:
+    lines = text.split('\n')
+    seen_lines = {}
+    clean_lines = []
+    
+    for line in lines:
+        line_stripped = line.strip()
+        if not line_stripped:
+            clean_lines.append(line)
+            continue
+        
+        if line_stripped in seen_lines:
+            seen_lines[line_stripped] += 1
+            if seen_lines[line_stripped] >= min_repeat:
+                continue
+        else:
+            seen_lines[line_stripped] = 1
+        
+        clean_lines.append(line)
+    
+    text = '\n'.join(clean_lines)
+    
+    pattern = r'(.{20,})(\1{2,})'
+    
+    def replace_repetition(match):
+        repeated_text = match.group(1)
+        return repeated_text + " [반복 제거]"
+    
+    text = re.sub(pattern, replace_repetition, text)
+    
+    return text
+
+
+def validate_analysis_logic(analysis_text: str) -> Tuple[bool, List[Dict]]:
+    issues = []
+    
+    pattern1 = re.finditer(r'답변:\s*✅\s*충분.*?영향도:\s*🔴\s*Critical', analysis_text, re.DOTALL | re.IGNORECASE)
+    for match in pattern1:
+        issues.append({
+            "type": "논리적 모순",
+            "desc": "'충분'하다고 답했으나 Critical로 평가",
+            "location": match.group()[:100]
+        })
+    
+    pattern2 = re.finditer(r'(\d+%)\s*(감소|증가|초과)', analysis_text)
+    for match in pattern2:
+        context = analysis_text[max(0, match.start()-200):match.end()+200]
+        if 'p.' not in context and '문서' not in context and '추정' not in context:
+            issues.append({
+                "type": "근거 부족",
+                "desc": f"정량적 표현 '{match.group()}' 출처 미명시",
+                "location": match.group()
+            })
+    
+    # 🆕 플레이스홀더 검증 강화
+    placeholders = re.findall(r'\[(페이지|금액|제목|구체적|담당|조직|번호|질문|인용)\]', analysis_text)
+    if placeholders:
+        issues.append({
+            "type": "출력 불완전",
+            "desc": f"플레이스홀더 발견: {set(placeholders)}",
+            "location": "multiple"
+        })
+    
+    is_valid = len(issues) == 0
+    return is_valid, issues
+
+
+def comprehensive_post_processing(text: str, label: str) -> str:
+    text = text.strip()
+    
+    unwanted_prefixes = [
+        "Here is", "Sure,", "Certainly,", "Of course,",
+        "I'll analyze", "Let me", "Based on the document",
+        "According to", "The document shows"
+    ]
+    
+    for prefix in unwanted_prefixes:
+        if text.startswith(prefix):
+            lines = text.split("\n")
+            if len(lines) > 1:
+                text = "\n".join(lines[1:]).strip()
+            break
+    
+    lines = text.split("\n")
+    if lines and (lines[0].startswith("##") or lines[0].startswith("**")):
+        text = "\n".join(lines[1:]).strip()
+    
+    while "\n\n\n" in text:
+        text = text.replace("\n\n\n", "\n\n")
+    
+    text = detect_and_remove_repetition(text)
+    
+    return text.strip()
+
+
+# ==============================================
+# Few-shot Examples (🔧 더 강조)
+# ==============================================
+
+ANALYSIS_EXAMPLES = """
+# ✅ 올바른 분석 예시 (반드시 따라하세요)
+
+## 예시 1: 예산 분석
+
+### ❓ 질문: 예산 증액(190만불)의 타당성이 문서에 충분히 설명되어 있는가?
+- **답변**: ⚠️ 부분적
+- **근거**: p.5에서 "1,060만불에서 1,250만불로 증액" 명시되어 있으나, p.12-15에 세부 내역 중 120만불(63%)의 사용처가 불명확함
+- **문제점**:
+  1) 증액 190만불 중 120만불의 구체적 사용처가 없음
+  2) 증액 없이 진행 시 대안 시나리오 검토 부재
+  3) 현지 물가 상승률 대비 증액률 타당성 검증 없음
+- **영향도**: 🟡 High
+- **예상 영향**: 예산심의위원회에서 투명성 문제 제기 가능성 높음, 심의 지연 1-2개월 예상
+- **권고사항**:
+  1) 즉시 (1주): 120만불 세부 breakdown 작성 - 예산 0원(기존 인력) - 담당 PMC
+  2) 단기 (1개월): 예산심의위원회 사전 설명 자료 준비 - 예산 5만불 - 담당 재무팀
+
+## 예시 2: 기술 타당성
+
+### ❓ 질문: 선택한 태양광 발전 시스템이 우기 4개월을 고려했을 때 현지 환경에 적합한가?
+- **답변**: ⚠️ 부분적
+- **근거**: p.28에서 "연평균 일조량 5.5kWh/m²/day"로 적합하다고 기술되어 있으나, p.29 기후 데이터에서 우기 4개월(6-9월) 동안 일조량 50% 감소 명시. p.32의 배터리 저장 3일분은 우기 120일 대비 매우 부족
+- **문제점**:
+  1) 우기 4개월간 전력 공급 안정성 심각하게 저하될 것으로 예상
+  2) 배터리 용량이 건기 기준으로만 계산되어 우기 미반영
+  3) 대체 전원(디젤 발전기 등) 계획이 전혀 없음
+- **영향도**: 🟡 High
+- **예상 영향**: 우기철 학교 및 보건소 운영 중단, 냉장 의약품 보관 실패로 인한 보건 리스크
+- **권고사항**:
+  1) 즉시 (2주): 배터리 용량 재산정 및 예산 영향 분석 - 예산 추가 50만불 - 담당 기술팀
+  2) 단기 (1개월): 하이브리드 시스템(태양광+디젤) 타당성 검토 - 예산 10만불(컨설팅) - 담당 PMC
+
+## 예시 3: 위험 관리
+
+### ❓ 질문: 고영향력 반대 집단(시민단체 X)에 대한 구체적 대응 전략이 수립되어 있는가?
+- **답변**: ❌ 없음
+- **근거**: p.57에서 "지역 시민단체 X의 환경 훼손 우려로 인한 반대 의견" 언급만 있고, p.58 이해관계자 분석표에서 "영향력 High, 협조도 Low"로 분류되었으나 구체적 engagement 전략이 전혀 없음
+- **문제점**:
+  1) 고영향력 반대 집단에 대한 대응 전략 완전 부재
+  2) 반대 사유인 환경 훼손 우려에 대한 구체적 해명 없음
+  3) 갈등 해결 메커니즘이나 중재 절차 미수립
+  4) 법적 소송 가능성에 대한 언급조차 없음
+- **영향도**: 🔴 Critical
+- **예상 영향**: 사업 착수 지연 6개월 이상, 법적 분쟁 발생 시 추가 비용 100만불 이상, 언론 보도로 인한 평판 리스크
+- **권고사항**:
+  1) 즉시 (1주): 시민단체 X와 긴급 미팅 주선 - 예산 2만불(통역 포함) - 담당 현지 사무소장
+  2) 단기 (2주): 환경영향평가 보완 및 대응 자료 준비 - 예산 15만불 - 담당 환경팀
+  3) 중기 (1개월): 갈등 조정 전문가 고용 및 협상 프로세스 수립 - 예산 25만불 - 담당 PMC
+
+---
+
+**중요**: 위 예시처럼 실제 내용으로 채워서 작성하세요. [질문], [구체적], [페이지] 같은 플레이스홀더를 절대 사용하지 마세요!
+"""
+
+# ==============================================
+# KOICA 섹터 정의 (v2.9와 동일)
+# ==============================================
+
+KOICA_SECTORS = {
+    "교육": {
+        "keywords": ["교육", "학교", "교사", "학생", "교과", "학습", "교육과정", "literacy", "대학", "직업훈련"],
+        "core_issues": ["교육 접근성 및 형평성", "교육 품질 및 학습 성과", "교사 역량 및 교육 인프라", "교육과정 현지화 및 적절성", "교육 거버넌스 및 재정"],
+        "critical_questions": ["교육 소외계층의 접근성이 보장되는가?", "학습 성과 측정 체계가 수립되어 있는가?", "현지 교육과정이 반영되었는가?", "교사 양성 계획이 있는가?", "사업 종료 후 예산 확보 계획은?"]
+    },
+    "보건": {
+        "keywords": ["보건", "의료", "건강", "병원", "클리닉", "질병", "백신", "health", "의사", "간호사", "환자"],
+        "core_issues": ["보건의료 접근성", "의료 서비스 질 및 안전", "주요 질병 부담", "보건 인력 및 인프라", "보건 시스템 강화"],
+        "critical_questions": ["주요 질병 부담을 파악했는가?", "의료인력 확보 계획이 현실적인가?", "의약품 지속 공급 방안은?", "보건정보시스템 계획은?", "현지 시스템 연계는?"]
+    },
+    "거버넌스·평화": {
+        "keywords": ["거버넌스", "평화", "법", "제도", "민주", "부패", "투명", "분쟁", "governance", "정부", "행정"],
+        "core_issues": ["정부 효과성", "부패 통제", "법치", "시민사회 참여", "분쟁 예방"],
+        "critical_questions": ["부패 위험 평가가 설계되었는가?", "시민 참여가 포함되었는가?", "법제도 실행 가능성은?", "정치 불안정 영향은?", "인권 기반 접근이 반영되었는가?"]
+    },
+    "농촌개발": {
+        "keywords": ["농촌", "농업", "농민", "농가", "작물", "가축", "식량", "rural", "agriculture", "영농", "수확"],
+        "core_issues": ["농가 소득 증대", "식량안보", "농업 생산성", "시장 접근성", "기후변화 적응"],
+        "critical_questions": ["소농 중심 접근인가?", "시장 접근성이 구체적인가?", "기후 스마트 농업이 포함되었는가?", "토지 갈등 가능성은?", "농민 조직화 계획은?"]
+    },
+    "물": {
+        "keywords": ["물", "수자원", "상하수도", "위생", "식수", "water", "sanitation", "정수", "배수"],
+        "core_issues": ["안전한 식수", "위생시설", "수자원 관리", "수질 모니터링", "물 안보"],
+        "critical_questions": ["수질 검사 체계는?", "유지보수 재원은?", "수인성 질병 목표는?", "지하수 지속가능성은?", "주민 참여형 관리는?"]
+    },
+    "에너지": {
+        "keywords": ["에너지", "전력", "발전", "송배전", "재생에너지", "태양광", "energy", "전기", "발전소"],
+        "core_issues": ["전력 보급률", "전력 안정성", "재생에너지 전환", "에너지 효율", "에너지 거버넌스"],
+        "critical_questions": ["재생에너지 목표가 현실적인가?", "전력망 연계는?", "전기요금 정책은?", "에너지 빈곤층 지원은?", "기술 적정성은?"]
+    },
+    "교통": {
+        "keywords": ["교통", "도로", "교량", "운송", "물류", "transport", "road", "고속도로", "항만"],
+        "core_issues": ["교통 접근성", "교통 안전", "유지보수", "물류 효율성", "환경 영향"],
+        "critical_questions": ["유지보수 재원은?", "교통안전 시설은?", "환경영향평가는?", "기후 리스크는?", "시장 접근성은?"]
+    },
+    "도시": {
+        "keywords": ["도시", "주거", "슬럼", "도시계획", "스마트시티", "urban", "주택", "도시개발"],
+        "core_issues": ["도시 빈곤", "도시계획", "도시 인프라", "스마트시티", "도시 회복력"],
+        "critical_questions": ["강제 이주 없는 접근인가?", "포용적 계획인가?", "기술 적정성은?", "재난 대응은?", "도농 연계는?"]
+    },
+    "과학기술혁신": {
+        "keywords": ["ICT", "디지털", "혁신", "기술", "연구", "innovation", "technology", "영사", "consular", "정보통신", "AI"],
+        "core_issues": ["디지털 격차", "ICT 인프라", "기술 이전", "혁신 생태계", "사이버 보안"],
+        "critical_questions": ["디지털 리터러시 교육은?", "솔루션 선택 타당성은?", "현지 기술 역량은?", "데이터 보호는?", "기술 종속 위험은?"]
+    },
+    "기후행동": {
+        "keywords": ["기후", "온실가스", "탄소", "적응", "완화", "climate", "환경", "배출"],
+        "core_issues": ["온실가스 감축", "기후변화 적응", "기후 재원", "기후 회복력", "NDC 이행"],
+        "critical_questions": ["감축량 측정 가능한가?", "취약계층 고려는?", "자연기반해법은?", "NDC 정합성은?", "장기 시나리오는?"]
+    },
+    "성평등": {
+        "keywords": ["성평등", "젠더", "여성", "소녀", "gender", "women", "여아"],
+        "core_issues": ["젠더 격차", "여성 역량강화", "젠더 폭력 예방", "여성 리더십", "젠더 주류화"],
+        "critical_questions": ["젠더 분석이 반영되었는가?", "여성 참여 목표는?", "GBV 예방은?", "돌봄 부담 감소는?", "젠더 데이터는?"]
+    },
+    "인권": {
+        "keywords": ["인권", "장애", "아동", "소수자", "취약계층", "human rights", "권리"],
+        "core_issues": ["인권 기반 접근", "사회적 배제", "취약계층 보호", "아동권리", "장애 포용"],
+        "critical_questions": ["Do No Harm이 적용되었는가?", "장애인 접근성은?", "아동 보호정책은?", "원주민 권리는?", "인권 영향평가는?"]
+    }
+}
+
+def detect_sector(text: str, extracted_info: str) -> Tuple[str, List[str]]:
+    full_text = (text + extracted_info).lower()
+    sector_scores = {}
+    
+    for sector, info in KOICA_SECTORS.items():
+        score = 0
+        matched_keywords = []
+        
+        for keyword in info["keywords"]:
+            count = full_text.count(keyword.lower())
+            if count > 0:
+                score += count
+                matched_keywords.append(f"{keyword}({count})")
+        
+        if score > 0:
+            sector_scores[sector] = {"score": score, "keywords": matched_keywords}
+    
+    if not sector_scores:
+        return "일반", []
+    
+    sorted_sectors = sorted(sector_scores.items(), key=lambda x: x[1]["score"], reverse=True)
+    primary_sector = sorted_sectors[0][0]
+    primary_score = sorted_sectors[0][1]["score"]
+    
+    sectors = [primary_sector]
+    
+    if len(sorted_sectors) > 1:
+        secondary_sector = sorted_sectors[1][0]
+        secondary_score = sorted_sectors[1][1]["score"]
+        
+        if secondary_score >= primary_score * 0.5:
+            sectors.append(secondary_sector)
+    
+    print(f"\n🎯 섹터: {', '.join(sectors)}")
+    
+    return sectors[0], sectors
+
+
+# ==============================================
+# TAG 프롬프트 (🔧 v3.0 대폭 개선)
+# ==============================================
+
+TAG_SYSTEM_PROMPT = """당신은 KOICA TAG 전문가입니다.
+
+# CRITICAL 규칙
+1. **플레이스홀더 절대 금지**: [질문], [구체적], [페이지], [금액], [조직] 등 대괄호 형식 사용 금지
+2. **실제 내용 작성**: 모든 칸을 실제 분석 내용으로 채우기
+3. **논리적 일관성**: ✅충분 → 🔴Critical 불가
+4. **근거 필수**: 페이지 번호 + 인용 내용
+
+**응답은 반드시 한국어로, 실제 내용으로 작성하세요.**"""
+
+
+# 🔧 Agent 1 프롬프트 완전 재작성
+PROJECT_MANAGER_PROMPT = """당신은 KOICA 프로젝트 관리 전문가(PMC)입니다.
+
+# 역할
+사업의 논리성, 실행 가능성, 위험을 검토하고 실행 가능한 권고안 제시
+
+# CRITICAL 지침
+- 제공된 예시를 정확히 따라 작성
+- [질문], [구체적], [페이지] 같은 플레이스홀더 절대 사용 금지
+- 모든 질문, 근거, 문제점, 권고를 실제 내용으로 채우기
+
+# 출력 형식
+각 질문:
+- ❓ 질문: [실제 구체적 질문 작성]
+- 답변: ✅/⚠️/❌
+- 근거: p.[번호] "[실제 인용]"
+- 문제점: (3개, 실제 내용)
+- 영향도: 🔴/🟡/🟢
+- 예상 영향: (구체적 기간/금액)
+- 권고사항: (즉시/단기/중기, 실제 예산/담당)"""
+
+
+def get_sector_expert_prompt(sector: str) -> str:
+    if sector not in KOICA_SECTORS:
+        return PROJECT_MANAGER_PROMPT
+    
+    sector_info = KOICA_SECTORS[sector]
+    
+    return f"""당신은 KOICA {sector} 분야 전문가입니다.
+
+# 전문 분야
+{sector} 섹터 국제개발협력
+
+# 핵심 검토 이슈
+{chr(10).join([f'{i+1}. {issue}' for i, issue in enumerate(sector_info['core_issues'])])}
+
+# 필수 검토 질문
+{chr(10).join([f'- {q}' for q in sector_info['critical_questions']])}
+
+# CRITICAL 지침
+- 실제 내용으로 작성
+- 플레이스홀더 사용 금지
+- 권고사항 필수 포함"""
+
+
+# ==============================================
+# 분석 함수들 (🔧 프롬프트 완전 재작성)
+# ==============================================
+
+@track_time
+def extract_key_info_rag(full_text: str, vector_db: Dict) -> str:
+    context, pages = search_relevant_chunks(
+        "사업명 기간 예산 목표 성과지표", 
+        vector_db, 
+        top_k=10
+    )
+    
+    user_prompt = f"""참고 문서 (p.{', '.join(map(str, pages))}):
+{context[:4000]}
+
+---
+
+위 문서에서 다음 정보를 추출하세요:
+
+## 사업 기본정보
+- **사업명**: [실제 사업명]
+- **기간**: [실제 기간]
+- **총 예산**: [실제 금액]
+- **사업 목표**: [실제 목표]
+- **협력기관**: [실제 기관명]
+
+## 주요 활동 (5개)
+1. [실제 활동 1]
+2. [실제 활동 2]
+...
+
+정보가 없으면 "문서에서 확인 불가"."""
+    
+    response = llm.create_chat_completion(
+        messages=[
+            {"role": "system", "content": TAG_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt}
+        ],
+        max_tokens=3000,
+        temperature=0.25,
+        repeat_penalty=1.15
+    )
+    
+    output = response['choices'][0]['message']['content']
+    return comprehensive_post_processing(output, "정보추출")
+
+
+@track_time
+def multi_agent_analysis(vector_db: Dict, extracted_info: str, text: str) -> Tuple[str, str, List[str]]:
+    """Multi-Agent 분석 (🔧 프롬프트 완전 재작성)"""
+    
+    primary_sector, all_sectors = detect_sector(text, extracted_info)
+    
+    print(f"\n🤝 Multi-Agent 분석")
+    print(f"  - Agent 1: PMC")
+    print(f"  - Agent 2: {primary_sector}")
+    
+    # Agent 1: PMC 분석 (🔧 완전 재작성)
+    print(f"\n👤 Agent 1...")
+    
+    pmc_areas = [
+        ("사업 논리성", "목표 성과지표 논리모형"),
+        ("기술적 타당성", "기술 시스템 인프라"),
+        ("예산 효율성", "예산 비용 단가"),
+        ("지속가능성", "지속가능성 역량강화"),
+        ("위험 관리", "위험 리스크 대응")
+    ]
+    
+    pmc_analysis = f"# 📊 Agent 1: PMC 분석\n\n---\n\n"
+    
+    for area_name, keywords in pmc_areas:
+        context, pages = search_relevant_chunks(keywords, vector_db, top_k=10)
+        
+        # 🔧 핵심 개선: 템플릿 제거, 예시 강조
+        user_prompt = f"""**검토 영역**: {area_name}
+
+**참고 문서** (p.{', '.join(map(str, pages))}):
+{context[:4000]}
+
+---
+
+{ANALYSIS_EXAMPLES}
+
+---
+
+위 예시를 정확히 따라, {area_name} 영역에서 **2개의 구체적인 질문**을 만들고 분석하세요.
+
+**중요**: 
+- 예시처럼 실제 내용으로 채우세요
+- [질문], [구체적], [페이지] 같은 플레이스홀더 절대 사용 금지
+- 각 질문마다 권고사항 필수 포함
+
+출력 예시:
+### ❓ 질문 1: 예산 증액 190만불의 타당성이 문서에 충분히 설명되어 있는가?
+- **답변**: ⚠️ 부분적
+- **근거**: p.5에서 "1,060만불→1,250만불" 명시, 그러나 120만불 사용처 불명확
+- **문제점**:
+  1) 120만불 세부 내역 없음
+  2) 대안 검토 부재
+  3) 타당성 검증 없음
+- **영향도**: 🟡 High
+- **예상 영향**: 심의 지연 1-2개월
+- **권고사항**:
+  1) 즉시 (1주): 세부 breakdown 작성 - 예산 0원 - 담당 PMC
+  2) 단기 (1개월): 설명 자료 준비 - 예산 5만불 - 담당 재무팀
+
+### ❓ 질문 2: [또 다른 실제 질문...]
+[위와 동일 형식]"""
+        
+        response = llm.create_chat_completion(
+            messages=[
+                {"role": "system", "content": PROJECT_MANAGER_PROMPT},
+                {"role": "user", "content": user_prompt}
+            ],
+            max_tokens=4000,
+            temperature=0.3,
+            repeat_penalty=1.2  # 🔧 반복 페널티 증가
+        )
+        
+        output = response['choices'][0]['message']['content']
+        output = comprehensive_post_processing(output, f"PMC-{area_name}")
+        
+        pmc_analysis += f"\n## {area_name}\n\n{output}\n\n"
+    
+    # Agent 2: 섹터 전문가
+    print(f"\n👤 Agent 2 ({primary_sector})...")
+    
+    if primary_sector in KOICA_SECTORS:
+        sector_info = KOICA_SECTORS[primary_sector]
+        
+        sector_keywords = " ".join(sector_info["keywords"][:8])
+        context, pages = search_relevant_chunks(sector_keywords, vector_db, top_k=12)
+        
+        sector_expert_prompt = get_sector_expert_prompt(primary_sector)
+        
+        user_prompt = f"""**섹터**: {primary_sector}
+
+**사업 정보**:
+{extracted_info[:1200]}
+
+**문서** (p.{', '.join(map(str, pages))}):
+{context[:5000]}
+
+---
+
+{primary_sector} 분야 전문가로서 다음을 분석하세요:
+
+## 핵심 이슈 검토
+{chr(10).join([f'{i+1}. {issue}' for i, issue in enumerate(sector_info['core_issues'])])}
+
+각 이슈별:
+- 현황: [문서 내용]
+- 평가: ✅/⚠️/❌
+- 문제점: (3개)
+- 권고사항: (즉시/단기, 예산, 담당)
+
+## 필수 질문
+{chr(10).join([f'{i+1}. {q}' for i, q in enumerate(sector_info['critical_questions'][:5])])}
+
+**중요**: 실제 내용으로 작성, 플레이스홀더 금지"""
+        
+        response = llm.create_chat_completion(
+            messages=[
+                {"role": "system", "content": sector_expert_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            max_tokens=5000,
+            temperature=0.35,
+            repeat_penalty=1.2
+        )
+        
+        sector_analysis = response['choices'][0]['message']['content']
+        sector_analysis = comprehensive_post_processing(sector_analysis, f"섹터-{primary_sector}")
+        
+    else:
+        sector_analysis = f"## {primary_sector} 분야\n\n일반 분야로 섹터 특화 분석 생략."
+    
+    full_analysis = f"""# 🎯 Multi-Agent TAG 분석
+
+**분석 체계**: PMC + {primary_sector}
+
+---
+
+{pmc_analysis}
+
+---
+
+# 📊 Agent 2: {primary_sector} 전문가
+
+{sector_analysis}
+"""
+    
+    return full_analysis, primary_sector, all_sectors
+
+
+@track_time
+def multi_agent_recommendations(vector_db: Dict, extracted_info: str, analysis: str, sector: str) -> str:
+    """통합 권고안"""
+    
+    context, pages = search_relevant_chunks("개선 권고", vector_db, top_k=10)
+    
+    user_prompt = f"""**섹터**: {sector}
+
+**분석 요약**:
+{analysis[:3000]}
+
+---
+
+통합 권고안 작성:
+
+## 🔴 Critical (3개)
+
+### 이슈 1: [실제 제목]
+- 분야: PMC / {sector}
+- 문제: [100자]
+- 즉시 조치: [조치] - 예산 [금액] - 담당 [조직]
+- 영향: [시나리오]
+
+### 이슈 2, 3: [동일]
+
+## 🟡 High (3개)
+
+### 이슈 4: [실제 제목]
+- 문제: [80자]
+- 조치: [조치] - 예산 - 담당
+- 효과: [정량적]
+
+## 💬 TAG 종합 의견
+
+### 핵심 요약 (3줄)
+1. [메시지]
+2. [메시지]
+3. [메시지]
+
+### 문서 품질: [점수]/100점
+
+### 최우선 조치 (3개)
+1. [조치] - 기간 - 예산 - 이유
+
+**중요**: 실제 내용 작성, 플레이스홀더 금지"""
+    
+    response = llm.create_chat_completion(
+        messages=[
+            {"role": "system", "content": f"{PROJECT_MANAGER_PROMPT}\n\n{get_sector_expert_prompt(sector)}"},
+            {"role": "user", "content": user_prompt}
+        ],
+        max_tokens=5000,
+        temperature=0.3,
+        repeat_penalty=1.2
+    )
+    
+    output = response['choices'][0]['message']['content']
+    output = comprehensive_post_processing(output, "통합권고")
+    
+    return output
+
+
+# ==============================================
+# 메인 함수, UI (v2.9와 유사)
+# ==============================================
+
+def upload_and_analyze_rag(pdf_file, progress=gr.Progress()):
+    vector_db = None
+    
+    try:
+        if pdf_file is None:
+            yield "❌ PDF 업로드 필요", "", "", "", ""
+            return
+        
+        progress(0, desc="📄 PDF...")
+        try:
+            with pdfplumber.open(pdf_file.name) as pdf:
+                total_pages = len(pdf.pages)
+                if total_pages == 0:
+                    yield "❌ 빈 PDF", "", "", "", ""
+                    return
+                text = "".join(page.extract_text() or "" for page in pdf.pages)
+                if len(text) < 500:
+                    yield "❌ 텍스트 부족", "", "", "", ""
+                    return
+        except Exception as e:
+            yield f"❌ PDF 실패: {str(e)}", "", "", "", ""
+            return
+        
+        filename = pdf_file.name.split('/')[-1]
+        status = f"✅ {filename}\n📄 {total_pages}p"
+        yield status, "", "", "", ""
+        
+        progress(0.1, desc="🔍 인덱싱...")
+        try:
+            chunks = chunk_text(text)
+            vector_db = create_vector_db(chunks)
+            
+            rag_info = f"""## 🗄️ 문서 정보
+
+**문서**: {total_pages}p, {len(text):,}자
+**청크**: {len(chunks)}개
+**시스템**: TAG v3.0 (질문 생성 강화)
+
+🔧 **v3.0 개선**:
+- Agent 1 질문 자동 생성
+- 플레이스홀더 완전 제거
+- repeat_penalty=1.2
+- Few-shot 강조
+
+✅ 인덱싱 완료!"""
+            
+            yield status, rag_info, "", "", ""
+        except Exception as e:
+            yield status, f"❌ 인덱싱 실패: {str(e)}", "", "", ""
+            return
+        
+        step1 = ""
+        try:
+            progress(0.2, desc="1️⃣ 정보...")
+            step1 = extract_key_info_rag(text, vector_db)
+            yield status, rag_info, step1, "", ""
+        except Exception as e:
+            step1 = f"❌ 1단계 실패: {str(e)}"
+            yield status, rag_info, step1, "", ""
+        
+        step2 = ""
+        detected_sector = "일반"
+        try:
+            progress(0.4, desc="2️⃣ 분석...")
+            step2, detected_sector, all_sectors = multi_agent_analysis(vector_db, step1, text)
+            
+            rag_info += f"\n\n## 🎯 섹터\n- **{detected_sector}**"
+            
+            yield status, rag_info, step1, step2, ""
+        except Exception as e:
+            step2 = f"❌ 2단계 실패: {str(e)}"
+            yield status, rag_info, step1, step2, ""
+        
+        step3 = ""
+        try:
+            progress(0.75, desc="3️⃣ 권고...")
+            step3 = multi_agent_recommendations(vector_db, step1, step2, detected_sector)
+        except Exception as e:
+            step3 = f"❌ 3단계 실패: {str(e)}"
+        
+        progress(1.0, desc="✅ 완료!")
+        
+        timing_summary = "\n".join([f"  - {k}: {sum(v):.1f}초" for k, v in timing_stats.items()])
+        
+        final_status = f"""{status}
+
+🎉 TAG 분석 완료!
+
+🎯 {detected_sector}
+
+⏱️ 시간:
+{timing_summary}
+
+🔧 v3.0:
+  ✅ 질문 자동 생성
+  ✅ 플레이스홀더 제거
+  ✅ 반복 방지"""
+        
+        yield final_status, rag_info, step1, step2, step3
+        
+    except Exception as e:
+        yield f"❌ 오류: {str(e)}", "", "", "", ""
+    
+    finally:
+        if vector_db:
+            del vector_db
+        torch.cuda.empty_cache()
+        gc.collect()
+
+
+def generate_clean_report(rag, info, analysis, recs):
+    report = f"""{'='*80}
+KOICA TAG v3.0 분석 보고서
+{'='*80}
+
+생성: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+{rag}
+
+{'='*80}
+1️⃣ 사업 정보
+{'='*80}
+
+{info}
+
+{'='*80}
+2️⃣ Multi-Agent 분석
+{'='*80}
+
+{analysis}
+
+{'='*80}
+3️⃣ 통합 권고
+{'='*80}
+
+{recs}
+"""
+    
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt', encoding='utf-8') as f:
+        f.write(report)
+        return f.name
+
+
+def generate_html_report(rag, info, analysis, recs):
+    def md_to_html(text):
+        text = text.replace('🔴', '<span>🔴</span>')
+        text = text.replace('🟡', '<span>🟡</span>')
+        text = text.replace('🟢', '<span>🟢</span>')
+        text = re.sub(r'^### (.*?)$', r'<h3>\1</h3>', text, flags=re.MULTILINE)
+        text = re.sub(r'^## (.*?)$', r'<h2>\1</h2>', text, flags=re.MULTILINE)
+        text = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', text)
+        return f'<div>{text}</div>'
+    
+    html_content = f"""<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>KOICA TAG v3.0</title>
+    <style>
+        body {{ font-family: 'Noto Sans KR', sans-serif; padding: 40px; max-width: 900px; margin: 0 auto; }}
+        h1 {{ color: #2E7D32; }}
+        h2 {{ color: #1976D2; margin-top: 40px; }}
+        .section {{ background: #FAFAFA; padding: 25px; margin: 25px 0; border-radius: 10px; }}
+    </style>
+</head>
+<body>
+    <h1>🎯 KOICA TAG v3.0</h1>
+    <p>생성: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}</p>
+    
+    <div class="section">{md_to_html(rag)}</div>
+    <h2>1️⃣ 사업 정보</h2>
+    <div class="section">{md_to_html(info)}</div>
+    <h2>2️⃣ 분석</h2>
+    <div class="section">{md_to_html(analysis)}</div>
+    <h2>3️⃣ 권고</h2>
+    <div class="section">{md_to_html(recs)}</div>
+</body>
+</html>
+"""
+    
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.html', encoding='utf-8') as f:
+        f.write(html_content)
+        return f.name
+
+
+demo = gr.Blocks(theme=gr.themes.Ocean(), title="KOICA TAG v3.0")
+
+with demo:
+    gr.Markdown("""
+    # 🎯 KOICA TAG v3.0 - 질문 생성 강화
+    
+    **🔧 v3.0 핵심 개선**:
+    1. ✅ **Agent 1 질문 자동 생성**: 템플릿 제거, 실제 질문 생성
+    2. ✅ **플레이스홀더 완전 제거**: [질문], [구체적] 등 제거
+    3. ✅ **Few-shot 예시 강조**: 3개 상세 예시
+    4. ✅ **repeat_penalty 증가**: 1.15 → 1.2
+    
+    **해결된 문제**:
+    - ❌ "질문 1: [구체적 질문]" → ✅ "실제 질문 생성"
+    - ❌ "답변: ✅충분 / ⚠️부분적" → ✅ "실제 답변 선택"
+    - ❌ 형식 깨짐 → ✅ 완전한 출력
+    """)
+    
+    with gr.Row():
+        with gr.Column(scale=1):
+            pdf_input = gr.File(label="📄 PDF", file_types=[".pdf"], type="filepath")
+            status_box = gr.Textbox(label="📊 상태", interactive=False, lines=15)
+    
+    with gr.Tabs():
+        with gr.Tab("0️⃣ 정보"):
+            rag_info = gr.Textbox(label="분석 정보", lines=20, interactive=False)
+        with gr.Tab("1️⃣ 핵심"):
+            info = gr.Textbox(label="사업 정보", lines=25, interactive=False)
+        with gr.Tab("2️⃣ 분석"):
+            analysis = gr.Textbox(label="Multi-Agent 분석 (질문 자동생성)", lines=50, interactive=False)
+        with gr.Tab("3️⃣ 권고"):
+            recs = gr.Textbox(label="통합 권고", lines=45, interactive=False)
+    
+    with gr.Row():
+        download_txt_btn = gr.DownloadButton(label="📥 TXT", visible=False)
+        download_html_btn = gr.DownloadButton(label="🌐 HTML", visible=False)
+    
+    def update_ui(pdf_file):
+        outputs = None
+        for outputs in upload_and_analyze_rag(pdf_file):
+            yield outputs + (gr.DownloadButton(visible=False), gr.DownloadButton(visible=False))
+        
+        if outputs and outputs[2] and outputs[3] and outputs[4]:
+            try:
+                txt_path = generate_clean_report(outputs[1], outputs[2], outputs[3], outputs[4])
+                html_path = generate_html_report(outputs[1], outputs[2], outputs[3], outputs[4])
+                
+                yield outputs + (
+                    gr.DownloadButton(value=txt_path, visible=True),
+                    gr.DownloadButton(value=html_path, visible=True)
+                )
+            except:
+                yield outputs + (gr.DownloadButton(visible=False), gr.DownloadButton(visible=False))
+    
+    pdf_input.change(
+        fn=update_ui,
+        inputs=[pdf_input],
+        outputs=[status_box, rag_info, info, analysis, recs, download_txt_btn, download_html_btn]
+    )
+
+print("=" * 80)
+print("🚀 KOICA TAG v3.0 (질문 생성 강화)")
+print("=" * 80)
+print("\n🔧 v3.0 개선:")
+print("  - Agent 1 질문 자동 생성")
+print("  - 플레이스홀더 완전 제거")
+print("  - Few-shot 예시 3개 강조")
+print("  - repeat_penalty=1.2")
+print("\n" + "=" * 80)
+
+demo.launch(share=True, debug=False, show_error=True)
